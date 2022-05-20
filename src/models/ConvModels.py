@@ -1,6 +1,146 @@
 import numpy as np
+import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
+import torchvision
+from pytorch_lightning.trainer import Trainer
 from torch import nn
+from torch.nn.functional import one_hot
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms
+from torchvision.datasets import MNIST
+
+from models import utils
+
+
+class VAEGAN(pl.LightningModule):
+
+    def __init__(self, in_shape, latent_shape, n_classes, cfg):
+        super().__init__()
+
+        self.encoder = Encoder(in_shape, latent_shape)
+        self.decoder = Decoder(in_shape, latent_shape, n_classes)
+        self.discriminator = Discriminator(in_shape)
+        self.cfg = cfg
+        self.validation_z = torch.randn(8, self.encoder.latent_dim)
+
+    def forward(self, img):
+        return self.encoder(img)
+
+    def pixelwise_loss(self, img1, img2, reduction='mean'):
+        return F.mse_loss(img1, img2, reduction=reduction)
+
+    def adversarial_loss(self, predictions, labels, reduction='mean'):
+        return F.binary_cross_entropy_with_logits(predictions,
+                                                  labels,
+                                                  reduction=reduction)
+
+    def kl_loss(self, var, mu, reduction='mean'):
+        return utils.kl_loss(var, mu, reduction)
+
+    def configure_optimizers(self):
+        vae_optimizer = torch.optim.Adam(list(self.encoder.parameters()) +
+                                         list(self.decoder.parameters()),
+                                         lr=float(self.cfg['lr_ae']))
+
+        discriminator_optimizer = torch.optim.Adam(
+            self.discriminator.parameters(),
+            lr=float(self.cfg['lr_discriminator']))
+
+        return vae_optimizer, discriminator_optimizer
+
+    def vae_step(self, imgs, labels):
+        one_hot_labels = one_hot(labels, num_classes=10)
+
+        z, mu, var = self.encoder(imgs)
+        recon_imgs = self.decoder(torch.cat([z, one_hot_labels], dim=1))
+
+        real_labels = torch.ones(imgs.size(0), 1).type_as(imgs)
+
+        disc_output = self.discriminator(recon_imgs)
+
+        kl_loss = self.kl_loss(var, mu, reduction='none')
+        recon_loss = self.pixelwise_loss(imgs, recon_imgs)
+        disc_loss = self.adversarial_loss(disc_output, real_labels)
+
+        z = torch.randn(size=z.shape).to(self.device)
+        y = torch.randint(low=0, high=torch.max(labels), size=labels.shape)
+        y = one_hot(y, num_classes=10).to(self.device)
+
+        gen_imgs = self.decoder(torch.cat([z, y], dim=1))
+        disc_output = self.discriminator(gen_imgs)
+
+        disc_loss += self.adversarial_loss(disc_output, real_labels)
+
+        cvae_loss = kl_loss + recon_loss + disc_loss
+
+        return cvae_loss
+
+    def discriminator_step(self, imgs, labels):
+        one_hot_labels = one_hot(labels, num_classes=10)
+
+        real_labels = torch.ones(imgs.size(0), 1).type_as(imgs)
+
+        disc_output = self.discriminator(imgs)
+        real_loss = self.adversarial_loss(disc_output, real_labels)
+
+        fake_labels = torch.zeros(imgs.size(0), 1).type_as(imgs)
+
+        # reconstruct images
+        z, mu, var = self.encoder(imgs)
+        recon_imgs = self.decoder(torch.cat([z, one_hot_labels], dim=1))
+
+        disc_output = self.discriminator(recon_imgs)
+        fake_loss = self.adversarial_loss(disc_output.detach(), fake_labels)
+
+        # gen images
+        z = torch.randn(size=z.shape).to(self.device)
+        y = torch.randint(low=0, high=torch.max(labels), size=labels.shape)
+        y = one_hot(y, num_classes=10).to(self.device)
+
+        gen_imgs = self.decoder(torch.cat([z, y], dim=1))
+        disc_output = self.discriminator(gen_imgs)
+
+        fake_loss += self.adversarial_loss(disc_output, fake_labels)
+
+        d_loss = real_loss + fake_loss
+
+        return d_loss
+
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        imgs, labels = batch
+
+        if optimizer_idx == 0:
+            return self.vae_step(imgs, labels)
+
+        if optimizer_idx == 1:
+            return self.discriminator_step(imgs, labels)
+
+    def train_dataloader(self):
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        dataset = MNIST('./datasets',
+                        train=True,
+                        download=True,
+                        transform=transform)
+
+        return DataLoader(dataset,
+                          batch_size=256,
+                          num_workers=8,
+                          pin_memory=True,
+                          shuffle=True)
+
+    def on_train_epoch_end(self):
+        z = self.validation_z.to(self.device)
+        y = torch.randint(low=0, high=9, size=(z.size(0), )).to(self.device)
+        print(f'Gen Y: {y}')
+        y = one_hot(y, num_classes=10)
+
+        sample_imgs = self.decoder(torch.cat([z, y], dim=1))
+        grid = torchvision.utils.make_grid(sample_imgs)
+        torchvision.utils.save_image(grid, fp=f'img-{self.current_epoch}.jpg')
+
 
 class Encoder(nn.Module):
 

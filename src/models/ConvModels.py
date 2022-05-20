@@ -171,8 +171,9 @@ class Encoder(nn.Module):
 
     def reparameterization(self, mu, logvar, latent_dim):
         std = torch.exp(logvar / 2)
-        sampled_z = torch.Tensor(
-            np.random.normal(0, 1, (mu.size(0), latent_dim)))
+        sampled_z = torch.normal(0, 1, size=(mu.size(0), latent_dim))
+        sampled_z = sampled_z.to(mu.device)
+
         z = sampled_z * std + mu
 
         return z

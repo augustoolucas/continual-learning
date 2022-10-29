@@ -1,0 +1,8 @@
+---
+train:
+    epochs: 5
+    batch_size: 128
+    lr_cvae: 1e-2
+    lr_cls: 2e-4
+test:
+    batch_size: 1024

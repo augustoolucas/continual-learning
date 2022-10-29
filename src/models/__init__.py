@@ -1,2 +1,3 @@
-from models.ConvModels import *
-from models.utils import *
+from models import MLPModels
+from models import ConvModels
+from models import IRCL

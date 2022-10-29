@@ -9,43 +9,43 @@ from torch.nn.functional import one_hot
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from torchvision.datasets import MNIST
+from cfg import cfg
 
-from models import utils
+import models.MLPModels as mlp
+from models import base, utils
 
 
-class VAEGAN(pl.LightningModule):
+class cVAE(base.cVAE):
 
-    def __init__(self, in_shape, latent_shape, n_classes, cfg):
-        super().__init__()
+    def __init__(self, in_shape, latent_shape, n_classes):
+        super().__init__(latent_shape)
 
         self.encoder = Encoder(in_shape, latent_shape)
         self.decoder = Decoder(in_shape, latent_shape, n_classes)
+
+
+class cVAEGAN(cVAE):
+
+    def __init__(self, in_shape, latent_shape, n_classes):
+        super().__init__(in_shape=in_shape,
+                         latent_shape=latent_shape,
+                         n_classes=n_classes)
+
         self.discriminator = Discriminator(in_shape)
-        self.cfg = cfg
-        self.validation_z = torch.randn(8, self.encoder.latent_dim)
-
-    def forward(self, img):
-        return self.encoder(img)
-
-    def pixelwise_loss(self, img1, img2, reduction='mean'):
-        return F.mse_loss(img1, img2, reduction=reduction)
 
     def adversarial_loss(self, predictions, labels, reduction='mean'):
         return F.binary_cross_entropy_with_logits(predictions,
                                                   labels,
                                                   reduction=reduction)
 
-    def kl_loss(self, var, mu, reduction='mean'):
-        return utils.kl_loss(var, mu, reduction)
-
     def configure_optimizers(self):
         vae_optimizer = torch.optim.Adam(list(self.encoder.parameters()) +
                                          list(self.decoder.parameters()),
-                                         lr=float(self.cfg['lr_ae']))
+                                         lr=float(cfg['lr_ae']))
 
         discriminator_optimizer = torch.optim.Adam(
             self.discriminator.parameters(),
-            lr=float(self.cfg['lr_discriminator']))
+            lr=float(cfg['lr_discriminator']))
 
         return vae_optimizer, discriminator_optimizer
 
@@ -116,35 +116,10 @@ class VAEGAN(pl.LightningModule):
         if optimizer_idx == 1:
             return self.discriminator_step(imgs, labels)
 
-    def train_dataloader(self):
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-        dataset = MNIST('./datasets',
-                        train=True,
-                        download=True,
-                        transform=transform)
-
-        return DataLoader(dataset,
-                          batch_size=256,
-                          num_workers=8,
-                          pin_memory=True,
-                          shuffle=True)
-
-    def on_train_epoch_end(self):
-        z = self.validation_z.to(self.device)
-        y = torch.randint(low=0, high=9, size=(z.size(0), )).to(self.device)
-        print(f'Gen Y: {y}')
-        y = one_hot(y, num_classes=10)
-
-        sample_imgs = self.decoder(torch.cat([z, y], dim=1))
-        grid = torchvision.utils.make_grid(sample_imgs)
-        torchvision.utils.save_image(grid, fp=f'img-{self.current_epoch}.jpg')
-
 
 class Encoder(nn.Module):
 
-    def __init__(self, in_shape, out_shape):
+    def __init__(self, in_shape, latent_shape):
         super().__init__()
         channels = in_shape[0] if in_shape[0] < in_shape[2] else in_shape[2]
         height = in_shape[0] if in_shape[0] > in_shape[2] else in_shape[1]
@@ -165,13 +140,13 @@ class Encoder(nn.Module):
         )
 
         feat_map_dim = (128, 7, 7) if height == 28 else (128, 8, 8)
-        self.mu = nn.Linear(np.prod(feat_map_dim), out_shape)
-        self.logvar = nn.Linear(np.prod(feat_map_dim), out_shape)
-        self.latent_dim = out_shape
+        self.mu = nn.Linear(np.prod(feat_map_dim), latent_shape)
+        self.logvar = nn.Linear(np.prod(feat_map_dim), latent_shape)
+        self.latent_shape = latent_shape
 
-    def reparameterization(self, mu, logvar, latent_dim):
+    def reparameterization(self, mu, logvar):
         std = torch.exp(logvar / 2)
-        sampled_z = torch.normal(0, 1, size=(mu.size(0), latent_dim))
+        sampled_z = torch.normal(0, 1, size=(mu.size(0), self.latent_shape))
         sampled_z = sampled_z.to(mu.device)
 
         z = sampled_z * std + mu
@@ -183,25 +158,25 @@ class Encoder(nn.Module):
         x = x.view(x.shape[0], -1)
         mu = self.mu(x)
         logvar = self.logvar(x)
-        z = self.reparameterization(mu, logvar, self.latent_dim)
+        z = self.reparameterization(mu, logvar)
 
         return z, mu, logvar
 
 
 class Decoder(nn.Module):
 
-    def __init__(self, in_shape, latent_dim, n_classes, use_label=True):
+    def __init__(self, out_shape, latent_shape, n_classes, use_label=True):
         super().__init__()
 
-        channels = in_shape[0] if in_shape[0] < in_shape[2] else in_shape[2]
-        height = in_shape[0] if in_shape[0] > in_shape[2] else in_shape[1]
+        channels = out_shape[0] if out_shape[0] < out_shape[2] else out_shape[2]
+        height = out_shape[0] if out_shape[0] > out_shape[2] else out_shape[1]
 
         assert channels in [1, 3]
         assert height in [28, 32]
 
         self.feat_map_dim = (128, 7, 7) if height == 28 else (128, 8, 8)
 
-        input_dim = latent_dim + n_classes if use_label else latent_dim
+        input_dim = latent_shape + n_classes if use_label else latent_shape
 
         self.linear_block = nn.Sequential(
             nn.Linear(input_dim, np.prod(self.feat_map_dim)),
@@ -220,8 +195,6 @@ class Decoder(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.in_shape = in_shape
-
     def forward(self, z):
         x = self.linear_block(z)
         x = self.conv_block(
@@ -232,7 +205,7 @@ class Decoder(nn.Module):
 
 class Specific(nn.Module):
 
-    def __init__(self, in_shape, specific_size):
+    def __init__(self, in_shape, specific_shape):
         super().__init__()
 
         channels = in_shape[0] if in_shape[0] < in_shape[2] else in_shape[2]
@@ -253,7 +226,7 @@ class Specific(nn.Module):
         feat_map_dim = (64, 3, 3) if height == 28 else (64, 4, 4)
 
         self.linear_block = nn.Sequential(
-            nn.Linear(np.prod(feat_map_dim), specific_size),
+            nn.Linear(np.prod(feat_map_dim), specific_shape),
             nn.ReLU(inplace=True))
 
     def forward(self, img):
@@ -264,35 +237,52 @@ class Specific(nn.Module):
         return x
 
 
-class Classifier(nn.Module):
+class ClassifierSpecific(pl.LightningModule):
 
-    def __init__(self,
-                 invariant_size,
-                 specific_size,
-                 classification_n_hidden,
-                 n_classes,
-                 softmax=False):
-        super(Classifier, self).__init__()
+    def __init__(self, in_shape, latent_shape, specific_shape, n_classes, lr):
+        super().__init__()
 
-        # classification module
-        self.classifier_layer = nn.Sequential(
-            nn.Linear(specific_size + invariant_size, classification_n_hidden),
-            nn.ReLU(inplace=True),
-        )
+        self.lr = lr
+        self.classifier = mlp.Classifier(latent_shape, specific_shape,
+                                         n_classes)
+        self.specific = Specific(in_shape, specific_shape)
 
-        modules = [nn.Linear(classification_n_hidden, n_classes)]
+    def forward(self, img):
+        return self.encoder(img)
 
-        if softmax:
-            modules.append(nn.Softmax(dim=1))
+    def classification_loss(self, predictions, labels, reduction='mean'):
+        return F.cross_entropy(predictions, labels, reduction=reduction)
 
-        self.output = nn.Sequential(*modules)
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.specific.parameters() +
+                                self.classifier.parameters(),
+                                lr=float(self.lr))
 
-    def forward(self, discriminative, invariant):
-        x = self.classifier_layer(torch.cat([discriminative, invariant],
-                                            dim=1))
-        logits = self.output(x)
+    def set_encoder(self, encoder):
+        self.encoder = encoder
 
-        return logits
+    def training_step(self, batch, batch_idx):
+        imgs, labels = batch
+
+        z, _, _ = self.encoder(imgs)
+        specific_embedding = self.specific(imgs)
+        classifier_output = self.classifier(specific_embedding, z.detach())
+        classifier_loss = self.classification_loss(classifier_output, labels)
+
+        return classifier_loss
+
+    def validation_step(self, batch, batch_idx):
+        return self.training_step(batch, batch_idx)
+
+    def on_train_epoch_end(self):
+        z = self.validation_z.to(self.device)
+        y = torch.randint(low=0, high=9, size=(z.size(0), )).to(self.device)
+        print(f'Gen Y: {y}')
+        y = one_hot(y, num_classes=10)
+
+        sample_imgs = self.decoder(torch.cat([z, y], dim=1))
+        grid = torchvision.utils.make_grid(sample_imgs, nrow=3)
+        torchvision.utils.save_image(grid, fp=f'img-{self.current_epoch}.jpg')
 
 
 class Discriminator(nn.Module):
